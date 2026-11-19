@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: eduhubpi-video-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # --timeout must exceed the worst-case upstream resolve (retries+backoff ~90s)
+    startCommand: gunicorn server:app --workers 2 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT
