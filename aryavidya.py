@@ -47,8 +47,22 @@ class UpstreamError(Exception):
         self.status = status
 
 
+# Optional residential proxy for the RESOLVE chain only — the challenge/PoW
+# flow rejects datacenter IPs (Render etc). Set EDUHUBPI_RESOLVE_PROXY to
+# enable; the CDN stream proxy in server.py never uses this.
+RESOLVE_PROXY = os.environ.get("EDUHUBPI_RESOLVE_PROXY", "").strip()
+
+
+def _resolve_proxies():
+    if RESOLVE_PROXY:
+        return {"http": RESOLVE_PROXY, "https": RESOLVE_PROXY}
+    return {}
+
+
 def _new_session():
     s = requests.Session()
+    if RESOLVE_PROXY:
+        s.proxies.update(_resolve_proxies())
     s.headers.update({
         "User-Agent": UA,
         "Referer": BASE + "/",
@@ -200,6 +214,7 @@ def _poll_e2e(job_id, v_stamp, chal, timeout=90):
     while time.time() < deadline:
         try:
             r = requests.get(E2E_STATUS_URL, params=params, timeout=15,
+                             proxies=_resolve_proxies(),
                              headers={"User-Agent": UA, "Referer": BASE + "/"})
             j = r.json()
             last = j
