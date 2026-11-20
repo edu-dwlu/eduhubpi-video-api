@@ -38,7 +38,7 @@ _upstream.mount("http://", HTTPAdapter(max_retries=Retry(
 
 CACHE_TTL_FALLBACK = 1800
 CACHE_SAFETY_MARGIN = 600
-ALLOWED_STREAM_HOSTS = ("testwave.cc", "pw.live", "aryavidya.cc")
+ALLOWED_STREAM_HOSTS = ("testwave.cc", "de5.net", "pw.live", "aryavidya.cc")
 
 _cache = {}
 _locks = {}
