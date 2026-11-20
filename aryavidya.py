@@ -207,7 +207,7 @@ def _policy_expiry(url):
         return None
 
 
-def _poll_e2e(job_id, v_stamp, chal, timeout=90):
+def _poll_e2e(job_id, v_stamp, chal, timeout=40):
     params = {"job_id": job_id, "v": v_stamp, "chal": chal}
     deadline = time.time() + timeout
     last = None
@@ -242,7 +242,7 @@ def _post_video_url(sess, token, v_stamp, env_sig):
     }
     body = {"token": token, "v_stamp": v_stamp, "env_sig": env_sig}
     r = sess.post(BASE + "/api/video-url-details.php", json=body,
-                  headers=headers, timeout=30)
+                  headers=headers, timeout=15)
     try:
         data = r.json()
     except Exception:
@@ -256,23 +256,33 @@ def _post_video_url(sess, token, v_stamp, env_sig):
 
 def resolve(video_id, batch_id="", title=None, poster=None,
             subject_id=None, topic_id=None,
-            max_attempts=12, min_delay=1.2, max_delay=4.0):
-    """Resolve a video to a signed m3u8 URL. Retries around the probabilistic gate."""
+            max_attempts=6, min_delay=0.15, max_delay=0.6):
+    """Resolve a video to a signed m3u8 URL.
+
+    Fast chains (~3-5s) with error-classified backoff: application-level
+    rejections (CDN_332 / decoy / challenge) get escalating delays to ride
+    out upstream rate windows; network blips retry quickly. Total wall
+    budget stays under ~55s because Render's edge drops connections ~61s.
+    """
     if not video_id:
         raise UpstreamError("video_id required")
     started = time.time()
+    RATE_BACKOFF = (1.0, 2.0, 4.0, 8.0, 12.0)
+    NET_BACKOFF = (0.5, 1.0, 2.0, 3.0, 4.0)
+    BUDGET = 55.0
     last_err = None
     for attempt in range(1, max_attempts + 1):
         sess = _new_session()
+        is_net = False
         try:
             url = _play_url(video_id, batch_id, title, poster, subject_id, topic_id)
-            r = sess.get(url, timeout=45)
+            r = sess.get(url, timeout=20)
             html = r.text
             if "Securing Player" in html:
                 chk = solve_challenge(html)
                 sess.cookies.set("_pw_sec_chk", chk, domain="stream.aryavidya.cc",
                                  path="/")
-                r = sess.get(url, timeout=45)
+                r = sess.get(url, timeout=20)
                 html = r.text
             page = extract_page(html)
             chk = sess.cookies.get("_pw_sec_chk") or ""
@@ -312,7 +322,15 @@ def resolve(video_id, batch_id="", title=None, poster=None,
             last_err = e
         except requests.RequestException as e:
             last_err = UpstreamError("network: %s" % e)
-        time.sleep(random.uniform(0.8, 2.0))
+            is_net = True
+        if attempt >= max_attempts:
+            break
+        schedule = NET_BACKOFF if is_net else RATE_BACKOFF
+        wait = schedule[min(attempt - 1, len(schedule) - 1)]
+        wait += random.uniform(0.0, 0.4)
+        if time.time() - started + wait > BUDGET:
+            break
+        time.sleep(wait)
     raise UpstreamError(
         "resolve failed after %d attempts (last: %s)" % (max_attempts, last_err),
         status=getattr(last_err, "status", None),

@@ -44,6 +44,27 @@ _cache = {}
 _locks = {}
 _guard = threading.Lock()
 
+# Background refresh: entries are re-resolved REFRESH_LEAD seconds before
+# they go stale, so user requests almost always hit a warm cache (<100ms).
+REFRESH_LEAD = 300
+REFRESH_RETRY = 60
+_refresh_stats = {"ok": 0, "fail": 0, "last_at": 0, "last_error": ""}
+
+
+def _store(video_id, data, params):
+    now = time.time()
+    exp = data.get("expires_at")
+    if exp:
+        cache_until = max(now + 60,
+                          min(exp - CACHE_SAFETY_MARGIN,
+                              now + CACHE_TTL_FALLBACK))
+    else:
+        cache_until = now + CACHE_TTL_FALLBACK
+    refresh_at = max(now + 60, cache_until - REFRESH_LEAD)
+    with _guard:
+        _cache[video_id] = {"data": data, "cache_until": cache_until,
+                            "refresh_at": refresh_at, "params": params}
+
 
 def _lock_for(key):
     with _guard:
@@ -65,8 +86,11 @@ def _allowed_stream_url(url):
 
 @app.get("/api/health")
 def health():
+    with _guard:
+        entries = len(_cache)
     return jsonify(ok=True, service="eduhubpi-video-api", upstream=av.BASE,
-                   time=int(time.time()))
+                   time=int(time.time()), cache_entries=entries,
+                   refresh=dict(_refresh_stats))
 
 
 @app.get("/api/videos/resolve")
@@ -85,7 +109,8 @@ def resolve():
 
     lock = _lock_for(video_id)
     with lock:
-        ent = _cache.get(video_id)
+        with _guard:
+            ent = _cache.get(video_id)
         if ent and not force and time.time() < ent["cache_until"]:
             out = dict(ent["data"])
             out.update(ok=True, cached=True)
@@ -98,14 +123,10 @@ def resolve():
         except av.UpstreamError as e:
             return jsonify(ok=False, error=str(e)), 502
 
-        exp = data.get("expires_at")
-        if exp:
-            cache_until = max(time.time() + 60,
-                              min(exp - CACHE_SAFETY_MARGIN,
-                                  time.time() + CACHE_TTL_FALLBACK))
-        else:
-            cache_until = time.time() + CACHE_TTL_FALLBACK
-        _cache[video_id] = {"data": data, "cache_until": cache_until}
+        _store(video_id, data, {
+            "batch_id": batch_id, "title": title, "poster": poster,
+            "subject_id": subject_id, "topic_id": topic_id,
+        })
 
         out = dict(data)
         out.update(ok=True, cached=False)
@@ -191,6 +212,53 @@ def _rewrite_playlist(text, base_url):
         else:
             out.append(enc(urllib.parse.urljoin(base, stripped)))
     return "\n".join(out) + "\n"
+
+
+def _refresh_entry(video_id):
+    with _guard:
+        ent = _cache.get(video_id)
+    if not ent:
+        return
+    params = ent.get("params") or {}
+    lock = _lock_for(video_id)
+    with lock:
+        with _guard:
+            ent = _cache.get(video_id)
+        if not ent or ent.get("refresh_at", 0) > time.time():
+            return
+        try:
+            data = av.resolve(video_id, params.get("batch_id") or "",
+                              title=params.get("title"),
+                              poster=params.get("poster"),
+                              subject_id=params.get("subject_id"),
+                              topic_id=params.get("topic_id"))
+        except Exception as e:
+            with _guard:
+                if video_id in _cache:
+                    _cache[video_id]["refresh_at"] = time.time() + REFRESH_RETRY
+            _refresh_stats["fail"] += 1
+            _refresh_stats["last_error"] = str(e)[:120]
+            _refresh_stats["last_at"] = int(time.time())
+            return
+        _store(video_id, data, params)
+        _refresh_stats["ok"] += 1
+        _refresh_stats["last_at"] = int(time.time())
+
+
+def _refresher_loop():
+    while True:
+        time.sleep(30)
+        with _guard:
+            due = [v for v, e in _cache.items()
+                   if e.get("refresh_at", 0) <= time.time()]
+        for v in due:
+            try:
+                _refresh_entry(v)
+            except Exception:
+                pass
+
+
+threading.Thread(target=_refresher_loop, daemon=True).start()
 
 
 @app.errorhandler(404)

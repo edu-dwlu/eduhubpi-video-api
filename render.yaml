@@ -4,5 +4,6 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    # --timeout must exceed the worst-case upstream resolve (retries+backoff ~90s)
-    startCommand: gunicorn server:app --workers 2 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT
+    # single worker = one shared cache + per-video locks; internal resolve
+    # budget is ~55s (gunicorn timeout keeps headroom above that)
+    startCommand: gunicorn server:app --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT
