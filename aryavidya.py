@@ -13,6 +13,7 @@ import random
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.parse
 
@@ -47,6 +48,37 @@ class UpstreamError(Exception):
         self.status = status
 
 
+class JobInProgress(Exception):
+    """E2E job detected in payload (fallback_polling) — poll async via wait_for_job."""
+
+    def __init__(self, ctx):
+        super().__init__("e2e job pending: %s" % ctx.get("job_id"))
+        self.ctx = ctx
+
+
+# Lightweight counters, surfaced by /api/health (observability).
+stats = {"resolves": 0, "challenge_solved": 0, "job_started": 0,
+         "job_completed": 0, "job_failed": 0}
+
+# _pw_sec_chk is valid ~1h (max-age=3600) — reuse it across resolves so
+# repeat requests skip the challenge GET entirely (speed + fewer upstream hits).
+_cookie_lock = threading.Lock()
+_pw_cookie = {"val": "", "exp": 0.0}
+
+
+def _get_pw_cookie():
+    with _cookie_lock:
+        if _pw_cookie["val"] and time.time() < _pw_cookie["exp"]:
+            return _pw_cookie["val"]
+    return ""
+
+
+def _set_pw_cookie(val, ttl=3600):
+    with _cookie_lock:
+        _pw_cookie["val"] = val or ""
+        _pw_cookie["exp"] = time.time() + (ttl if val else 0.0)
+
+
 # Optional residential proxy for the RESOLVE chain only — the challenge/PoW
 # flow rejects datacenter IPs (Render etc). Set EDUHUBPI_RESOLVE_PROXY to
 # enable; the CDN stream proxy in server.py never uses this.
@@ -68,6 +100,9 @@ def _new_session():
         "Referer": BASE + "/",
         "Accept-Language": "en-US,en;q=0.9",
     })
+    chk = _get_pw_cookie()
+    if chk:
+        s.cookies.set("_pw_sec_chk", chk, domain="stream.aryavidya.cc", path="/")
     return s
 
 
@@ -207,24 +242,99 @@ def _policy_expiry(url):
         return None
 
 
-def _poll_e2e(job_id, v_stamp, chal, timeout=40):
-    params = {"job_id": job_id, "v": v_stamp, "chal": chal}
+def _job_urls(job_id, v_stamp, chal, status_url=""):
+    """Status URL candidates, player parity (RECON C8).
+
+    Primary: path-segment form on statusforApp (the form the working player
+    sends; query-param form 404s live). Fallback: the payload's status_url.
+    """
+    q = "v=%s&chal=%s" % (urllib.parse.quote(str(v_stamp)),
+                           urllib.parse.quote(str(chal)))
+    urls = [E2E_STATUS_URL.rstrip("/") + "/" +
+            urllib.parse.quote(str(job_id)) + "?" + q]
+    if status_url:
+        su = str(status_url).strip()
+        if "{job_id}" in su:
+            su = su.replace("{job_id}", urllib.parse.quote(str(job_id)))
+        sep = "&" if "?" in su else "?"
+        if "job_id=" not in su and str(job_id) not in su:
+            su = su + sep + "job_id=" + urllib.parse.quote(str(job_id))
+            sep = "&"
+        if "v=" not in su:
+            su = su + sep + q
+        urls.append(su)
+    return urls
+
+
+def _decode_job_url(s, key, iv):
+    """Decode the c=1 `s` field: AES-256-CBC first (payload key/iv), atob fallback."""
+    try:
+        pt = unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(
+            base64.b64decode(s)), 16).decode("utf8", "replace")
+        if pt.startswith("http"):
+            return pt
+    except Exception:
+        pass
+    try:
+        pt = base64.b64decode(s).decode("utf8")
+        if pt.startswith("http"):
+            return pt
+    except Exception:
+        pass
+    raise UpstreamError("cannot decode e2e job url (s is neither AES/http nor atob/http)")
+
+
+def poll_e2e(job_id, v_stamp, chal, key=None, iv=None, status_url="",
+             timeout=900.0, interval=2.0, on_progress=None):
+    """Poll an E2E job until terminal response (player parity, RECON C8).
+
+    Response {c,s,p,ph,e}: c=0 in progress (p=progress %, ph=phase);
+    c=1 + s success; c=2 or e=1 failure (fail fast, no wasted timeout).
+    """
+    if key is None:
+        key = hashlib.sha256((str(v_stamp) + chal + "pw_secure_resp").encode()).digest()
+    if iv is None:
+        iv = hashlib.md5((chal + str(v_stamp) + "pw_secure_iv").encode()).digest()
+    urls = _job_urls(job_id, v_stamp, chal, status_url)
     deadline = time.time() + timeout
     last = None
+    idx = 0
     while time.time() < deadline:
+        url = urls[idx % len(urls)]
         try:
-            r = requests.get(E2E_STATUS_URL, params=params, timeout=15,
-                             proxies=_resolve_proxies(),
+            r = requests.get(url, timeout=15, proxies=_resolve_proxies(),
                              headers={"User-Agent": UA, "Referer": BASE + "/"})
             j = r.json()
             last = j
-            s = j.get("s")
-            if s:
-                return base64.b64decode(s).decode("utf8")
+            if r.status_code == 200:
+                c = j.get("c")
+                if on_progress and j.get("p") is not None:
+                    try:
+                        on_progress(j.get("p"), j.get("ph"))
+                    except Exception:
+                        pass
+                if c == 1 and j.get("s"):
+                    return _decode_job_url(j["s"], key, iv)
+                if c == 2 or j.get("e") == 1:
+                    raise UpstreamError("e2e job failed: %r" % {
+                        k: j.get(k) for k in ("c", "e", "p", "ph")})
+            else:
+                idx += 1  # rotate to next candidate (404 etc.)
+        except UpstreamError:
+            raise
         except Exception:
-            pass
-        time.sleep(2)
+            idx += 1
+        time.sleep(interval)
     raise UpstreamError("e2e job did not complete: %r" % (last,))
+
+
+def wait_for_job(ctx, timeout=900.0, interval=2.0, on_progress=None):
+    """Poll a JobInProgress ctx (same-session key/iv/chal) until terminal."""
+    return poll_e2e(ctx["job_id"], ctx["v_stamp"], ctx["chal"],
+                    key=ctx["key"], iv=ctx["iv"],
+                    status_url=ctx.get("status_url") or "",
+                    timeout=timeout, interval=interval,
+                    on_progress=on_progress)
 
 
 def _post_video_url(sess, token, v_stamp, env_sig):
@@ -254,15 +364,44 @@ def _post_video_url(sess, token, v_stamp, env_sig):
     return data
 
 
+def _build_result(page, plain, video_url, video_id, batch_id, started, attempt=1):
+    return {
+        "video_id": page["video_id"] or video_id,
+        "batch_id": page["batch_id"] or batch_id,
+        "subject_id": page["subject_id"],
+        "topic_id": page["topic_id"],
+        "title": page["title"],
+        "poster": page["poster"],
+        "is_live": page["is_live"] == "1",
+        "urlType": plain.get("urlType") or "penpencilvdo",
+        "stream_url": video_url,
+        "drm": {
+            "has_drm": bool(plain.get("license_url")),
+            "license_url": plain.get("license_url") or "",
+            "license_token": plain.get("license_token") or "",
+            "key_id": plain.get("signed_key_id") or "",
+            "key_value": plain.get("signed_key") or "",
+        },
+        "expires_at": _policy_expiry(video_url),
+        "attempts": attempt,
+        "resolved_in_s": round(time.time() - started, 1),
+    }
+
+
 def resolve(video_id, batch_id="", title=None, poster=None,
             subject_id=None, topic_id=None,
-            max_attempts=6, min_delay=0.15, max_delay=0.6):
+            max_attempts=6, min_delay=0.15, max_delay=0.6, job_wait=0.0):
     """Resolve a video to a signed m3u8 URL.
 
     Fast chains (~3-5s) with error-classified backoff: application-level
     rejections (CDN_332 / decoy / challenge) get escalating delays to ride
     out upstream rate windows; network blips retry quickly. Total wall
     budget stays under ~55s because Render's edge drops connections ~61s.
+
+    E2E jobs (payload fallback_polling): with job_wait=0 (default) raises
+    JobInProgress immediately carrying a ctx for wait_for_job() — callers
+    should poll async so the HTTP request never blocks on a multi-minute
+    job. job_wait>0 polls synchronously for up to that many seconds.
     """
     if not video_id:
         raise UpstreamError("video_id required")
@@ -280,6 +419,8 @@ def resolve(video_id, batch_id="", title=None, poster=None,
             html = r.text
             if "Securing Player" in html:
                 chk = solve_challenge(html)
+                _set_pw_cookie(chk)
+                stats["challenge_solved"] += 1
                 sess.cookies.set("_pw_sec_chk", chk, domain="stream.aryavidya.cc",
                                  path="/")
                 r = sess.get(url, timeout=20)
@@ -293,31 +434,37 @@ def resolve(video_id, batch_id="", title=None, poster=None,
             resp = _post_video_url(sess, page["token"], v_stamp, "env_1_ok")
             plain = decrypt_payload(resp["enc_payload"], v_stamp, chk)
             video_url = plain.get("video_url") or ""
-            if plain.get("job_id") and not video_url.startswith("http"):
-                video_url = _poll_e2e(plain["job_id"], v_stamp, chk)
+            if plain.get("fallback_polling"):
+                job_id = str(plain.get("job_id") or "")
+                if not job_id:
+                    raise UpstreamError("fallback_polling set but job_id missing")
+                key = hashlib.sha256(
+                    (str(v_stamp) + chk + "pw_secure_resp").encode()).digest()
+                iv = hashlib.md5(
+                    (chk + str(v_stamp) + "pw_secure_iv").encode()).digest()
+                ctx = {
+                    "job_id": job_id, "v_stamp": v_stamp, "chal": chk,
+                    "key": key, "iv": iv,
+                    "status_url": plain.get("status_url") or "",
+                    "page": page, "plain": plain,
+                    "video_id": page["video_id"] or video_id,
+                    "batch_id": page["batch_id"] or batch_id,
+                }
+                if job_wait and job_wait > 0:
+                    video_url = poll_e2e(
+                        job_id, v_stamp, chk, key=key, iv=iv,
+                        status_url=ctx["status_url"],
+                        timeout=min(job_wait,
+                                    max(5.0, BUDGET - (time.time() - started))))
+                else:
+                    raise JobInProgress(ctx)
             if not video_url.startswith("http"):
                 raise UpstreamError("no video_url in payload: %r" % sorted(plain))
-            return {
-                "video_id": page["video_id"] or video_id,
-                "batch_id": page["batch_id"] or batch_id,
-                "subject_id": page["subject_id"],
-                "topic_id": page["topic_id"],
-                "title": page["title"],
-                "poster": page["poster"],
-                "is_live": page["is_live"] == "1",
-                "urlType": plain.get("urlType") or "penpencilvdo",
-                "stream_url": video_url,
-                "drm": {
-                    "has_drm": bool(plain.get("license_url")),
-                    "license_url": plain.get("license_url") or "",
-                    "license_token": plain.get("license_token") or "",
-                    "key_id": plain.get("signed_key_id") or "",
-                    "key_value": plain.get("signed_key") or "",
-                },
-                "expires_at": _policy_expiry(video_url),
-                "attempts": attempt,
-                "resolved_in_s": round(time.time() - started, 1),
-            }
+            stats["resolves"] += 1
+            return _build_result(page, plain, video_url,
+                                 page["video_id"] or video_id,
+                                 page["batch_id"] or batch_id,
+                                 started, attempt)
         except UpstreamError as e:
             last_err = e
         except requests.RequestException as e:
