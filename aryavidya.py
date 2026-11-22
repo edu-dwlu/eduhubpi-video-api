@@ -263,25 +263,32 @@ def _policy_expiry(url):
 
 
 def _job_urls(job_id, v_stamp, chal, status_url=""):
-    """Status URL candidates, player parity (RECON C8).
+    """Status URL candidates (live deep probe 22 Nov 2026, RECON C8).
 
-    Primary: path-segment form on statusforApp (the form the working player
-    sends; query-param form 404s live). Fallback: the payload's status_url.
+    1. streamfiles bare path — no query at all: works without v/chal (the
+       service needs no auth) and kept working during a window when the
+       query form transiently 404'd on the same host.
+    2. streamfiles path-segment + v/chal query — the player's exact form;
+       with correct params the service returns `s` AES-encoded instead of
+       plain atob base64 (same URL either way).
+    3. payload status_url (heroku) bare — answers {c,s,p,ph} while the job
+       runs, but its terminal schema is {status:"success",video_url} with a
+       foreign key: usable as a done-signal, decode may fail (poll_e2e
+       rotates back for a decodable form).
     """
+    base = E2E_STATUS_URL.rstrip("/")
+    jid = urllib.parse.quote(str(job_id))
     q = "v=%s&chal=%s" % (urllib.parse.quote(str(v_stamp)),
                            urllib.parse.quote(str(chal)))
-    urls = [E2E_STATUS_URL.rstrip("/") + "/" +
-            urllib.parse.quote(str(job_id)) + "?" + q]
+    urls = [base + "/" + jid,
+            base + "/" + jid + "?" + q]
     if status_url:
         su = str(status_url).strip()
         if "{job_id}" in su:
-            su = su.replace("{job_id}", urllib.parse.quote(str(job_id)))
-        sep = "&" if "?" in su else "?"
-        if "job_id=" not in su and str(job_id) not in su:
-            su = su + sep + "job_id=" + urllib.parse.quote(str(job_id))
-            sep = "&"
-        if "v=" not in su:
-            su = su + sep + q
+            su = su.replace("{job_id}", jid)
+        elif str(job_id) not in su:
+            sep = "&" if "?" in su else "?"
+            su = su + sep + "job_id=" + jid
         urls.append(su)
     return urls
 
@@ -306,10 +313,19 @@ def _decode_job_url(s, key, iv):
 
 def poll_e2e(job_id, v_stamp, chal, key=None, iv=None, status_url="",
              timeout=900.0, interval=2.0, on_progress=None):
-    """Poll an E2E job until terminal response (player parity, RECON C8).
+    """Poll an E2E job until terminal response (RECON C8, deep-probed 22 Nov).
 
-    Response {c,s,p,ph,e}: c=0 in progress (p=progress %, ph=phase);
-    c=1 + s success; c=2 or e=1 failure (fail fast, no wasted timeout).
+    Response shapes (live-verified):
+      streamfiles: {c,s,p,ph,e} — c=0 in progress (p=% , ph=phase);
+        c=1 + s success (s = AES with payload key/iv when v+chal correct,
+        plain atob base64 otherwise); c=2 or e=1 failure.
+      heroku status_url in-progress: {c,p,ph} (same);
+        terminal: {status:"success", video_url:<foreign-key blob>} — decode
+        with our key may fail → rotate to a decodable candidate; if every
+        candidate stays undecodable, raise "re-resolve needed" (a fresh
+        resolve chain then returns the flipped direct URL).
+      unknown job_id: bare {c:0} with NO p forever → fail fast after 15
+      consecutive such polls (phantom in-progress guard).
     """
     if key is None:
         key = hashlib.sha256((str(v_stamp) + chal + "pw_secure_resp").encode()).digest()
@@ -319,6 +335,8 @@ def poll_e2e(job_id, v_stamp, chal, key=None, iv=None, status_url="",
     deadline = time.time() + timeout
     last = None
     idx = 0
+    no_p_streak = 0          # consecutive c=0 responses lacking p (phantom jobs)
+    undecodable_streak = 0   # consecutive terminal successes we cannot decode
     while time.time() < deadline:
         url = urls[idx % len(urls)]
         try:
@@ -327,17 +345,49 @@ def poll_e2e(job_id, v_stamp, chal, key=None, iv=None, status_url="",
             j = r.json()
             last = j
             if r.status_code == 200:
+                # heroku terminal schema (foreign-key blob)
+                if j.get("status") == "success" and j.get("video_url"):
+                    try:
+                        return _decode_job_url(j["video_url"], key, iv)
+                    except UpstreamError:
+                        undecodable_streak += 1
+                        if undecodable_streak >= 3:
+                            raise UpstreamError(
+                                "e2e job complete but url undecodable on all"
+                                " candidates — re-resolve needed")
+                        idx += 1
+                        time.sleep(interval)
+                        continue
                 c = j.get("c")
+                if c == 1 and j.get("s"):
+                    try:
+                        return _decode_job_url(j["s"], key, iv)
+                    except UpstreamError:
+                        undecodable_streak += 1
+                        if undecodable_streak >= 3:
+                            raise UpstreamError(
+                                "e2e job complete but url undecodable on all"
+                                " candidates — re-resolve needed")
+                        idx += 1
+                        time.sleep(interval)
+                        continue
+                if c == 2 or j.get("e") == 1:
+                    raise UpstreamError("e2e job failed: %r" % {
+                        k: j.get(k) for k in ("c", "e", "p", "ph")})
+                if c == 0:
+                    if j.get("p") is None:
+                        no_p_streak += 1
+                        if no_p_streak >= 15:
+                            raise UpstreamError(
+                                "e2e job not found (status service has no"
+                                " record of %s)" % job_id)
+                    else:
+                        no_p_streak = 0
                 if on_progress and j.get("p") is not None:
                     try:
                         on_progress(j.get("p"), j.get("ph"))
                     except Exception:
                         pass
-                if c == 1 and j.get("s"):
-                    return _decode_job_url(j["s"], key, iv)
-                if c == 2 or j.get("e") == 1:
-                    raise UpstreamError("e2e job failed: %r" % {
-                        k: j.get(k) for k in ("c", "e", "p", "ph")})
             else:
                 idx += 1  # rotate to next candidate (404 etc.)
         except UpstreamError:

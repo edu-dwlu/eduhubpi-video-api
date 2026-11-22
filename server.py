@@ -151,8 +151,24 @@ def _job_worker(video_id, ctx, params):
 
     try:
         started = time.time()
-        video_url = av.wait_for_job(ctx, timeout=JOB_TIMEOUT, interval=2.0,
-                                    on_progress=on_progress)
+        try:
+            video_url = av.wait_for_job(ctx, timeout=JOB_TIMEOUT, interval=2.0,
+                                        on_progress=on_progress)
+        except av.UpstreamError as e:
+            if "re-resolve" not in str(e):
+                raise
+            # Job finished but every status host's terminal blob used a
+            # foreign key — a fresh resolve chain now returns the flipped
+            # direct URL (payload drops job fields after completion, C8).
+            data = av.resolve(video_id, batch_id=params.get("batch_id") or "",
+                              title=params.get("title"),
+                              poster=params.get("poster"),
+                              subject_id=params.get("subject_id"),
+                              topic_id=params.get("topic_id"),
+                              job_wait=0)
+            _store(video_id, data, params)
+            av.stats["job_completed"] += 1
+            return
         ctx["plain"]["video_url"] = video_url
         data = av._build_result(ctx["page"], ctx["plain"], video_url,
                                 ctx["video_id"], ctx["batch_id"], started, 1)
