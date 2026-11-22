@@ -80,21 +80,41 @@ def _set_pw_cookie(val, ttl=3600):
 
 
 # Optional residential proxy for the RESOLVE chain only — the challenge/PoW
-# flow rejects datacenter IPs (Render etc). Set EDUHUBPI_RESOLVE_PROXY to
-# enable; the CDN stream proxy in server.py never uses this.
-RESOLVE_PROXY = os.environ.get("EDUHUBPI_RESOLVE_PROXY", "").strip()
+# flow rejects datacenter IPs (Render etc). Config lives in resolve_proxy.conf
+# (file wins when it has a value) with EDUHUBPI_RESOLVE_PROXY as fallback;
+# the CDN stream proxy in server.py never uses this.
+PROXY_CONF = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "resolve_proxy.conf")
+
+
+def _load_resolve_proxy():
+    """File first (edited any time, re-read every call), then env fallback."""
+    try:
+        with open(PROXY_CONF, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except OSError:
+        pass
+    return os.environ.get("EDUHUBPI_RESOLVE_PROXY", "").strip()
+
+
+RESOLVE_PROXY = _load_resolve_proxy()  # import-time snapshot (probe scripts)
 
 
 def _resolve_proxies():
-    if RESOLVE_PROXY:
-        return {"http": RESOLVE_PROXY, "https": RESOLVE_PROXY}
+    proxy = _load_resolve_proxy()  # live read: file edits apply immediately
+    if proxy:
+        return {"http": proxy, "https": proxy}
     return {}
 
 
 def _new_session():
     s = requests.Session()
-    if RESOLVE_PROXY:
-        s.proxies.update(_resolve_proxies())
+    proxies = _resolve_proxies()
+    if proxies:
+        s.proxies.update(proxies)
     s.headers.update({
         "User-Agent": UA,
         "Referer": BASE + "/",
