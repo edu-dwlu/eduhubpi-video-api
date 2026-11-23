@@ -4,6 +4,8 @@ Endpoints:
   GET /api/health
   GET /api/videos/resolve?video_id=...&batch_id=...[&force=1]
   GET /api/videos/stream?u=<signed upstream url>   (CORS-safe proxy, playlist rewrite)
+  POST /api/index?batch_id=...[&warm=0][&force=1]  (index a batch's lectures)
+  GET  /api/index?batch_id=...                     (index status)
 """
 
 import re
@@ -18,6 +20,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import aryavidya as av
+import indexer
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -66,6 +69,17 @@ BREAKER_COOLDOWN = 30.0
 REFRESH_LEAD = 300
 REFRESH_RETRY = 60
 _refresh_stats = {"ok": 0, "fail": 0, "last_at": 0, "last_error": ""}
+
+# Batch lecture indexing: catalog (indexer.harvest_batch) + a warm pass
+# that pre-resolves every lecture into _cache, so player requests hit
+# <100ms.  Videos whose upstream answer is the deterministic 500
+# "API Failed" (AryaVidya's own SPA is stuck on them too) go into
+# broken[] and short-circuit instantly on resolve; re-probed every
+# INDEX_RECHECK seconds by the refresher loop.
+_index = {}                        # batch_id -> index state dict
+_index_locks = {}
+INDEX_RECHECK = 20 * 60
+_index_stats = {"started": 0, "warmed": 0, "broken_marked": 0}
 
 
 def _store(video_id, data, params):
@@ -189,15 +203,271 @@ def _job_worker(video_id, ctx, params):
             _jobs.pop(video_id, None)
 
 
+# ---- batch lecture indexing ------------------------------------------
+
+def _index_lock_for(batch_id):
+    with _guard:
+        if batch_id not in _index_locks:
+            _index_locks[batch_id] = threading.Lock()
+        return _index_locks[batch_id]
+
+
+def _index_status(batch_id):
+    with _guard:
+        ent = _index.get(batch_id)
+        if not ent:
+            return None
+        return {
+            "ok": True, "batch_id": batch_id, "state": ent.get("state"),
+            "name": ent.get("name", ""), "total": ent.get("total", 0),
+            "warmed": ent.get("warmed", 0),
+            "broken_count": len(ent.get("broken") or {}),
+            "broken": sorted(ent.get("broken") or {}),
+            "subjects": len(ent.get("subjects") or []),
+            "topics": len(ent.get("topics") or []),
+            "indexed_at": ent.get("indexed_at", 0),
+            "error": ent.get("error", ""),
+        }
+
+
+def _ensure_index(batch_id, warm=True):
+    """Start background indexing unless this batch is already running/done."""
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", batch_id or ""):
+        return None
+    with _guard:
+        ent = _index.get(batch_id)
+        if ent:
+            state = ent.get("state")
+            if state in ("harvesting", "warming", "done"):
+                return ent
+            if state == "error" and \
+                    time.time() - ent.get("started", 0) < 120:
+                return ent          # cool-off before retrying a failed run
+    lock = _index_lock_for(batch_id)
+    with lock:
+        with _guard:
+            ent = _index.get(batch_id)
+            if ent:
+                state = ent.get("state")
+                if state in ("harvesting", "warming", "done"):
+                    return ent
+                if state == "error" and \
+                        time.time() - ent.get("started", 0) < 120:
+                    return ent
+            ent = {"state": "harvesting", "batch_id": batch_id, "name": "",
+                   "subjects": [], "topics": [], "lectures": {},
+                   "total": 0, "warmed": 0, "broken": {},
+                   "indexed_at": 0, "error": "",
+                   "started": time.time()}
+            _index[batch_id] = ent
+            _index_stats["started"] += 1
+        threading.Thread(target=_index_worker, args=(batch_id, warm),
+                         daemon=True).start()
+        return ent
+
+
+def _mark_broken(batch_id, video_id, error):
+    """Record a deterministic upstream-500 video (instant short-circuit)."""
+    now = time.time()
+    with _guard:
+        ent = _index.get(batch_id)
+        if not ent:
+            return False
+        ent.setdefault("broken", {})[video_id] = {
+            "error": str(error)[:160], "at": int(now),
+            "recheck_at": now + INDEX_RECHECK}
+        _index_stats["broken_marked"] += 1
+        return True
+
+
+def _index_worker(batch_id, warm):
+    try:
+        cat = indexer.harvest_batch(batch_id)
+        lectures = cat.get("lectures") or {}
+        with _guard:
+            ent = _index.get(batch_id)
+            if not ent:
+                return
+            ent.update(name=cat.get("name", ""),
+                       subjects=cat.get("subjects") or [],
+                       topics=cat.get("topics") or [],
+                       lectures=lectures, total=len(lectures),
+                       indexed_at=cat.get("indexed_at") or int(time.time()),
+                       error="")
+            ent["state"] = "warming" if warm else "done"
+        if not warm:
+            return
+        _warm_batch(batch_id, lectures)
+        with _guard:
+            ent = _index.get(batch_id)
+            if ent and ent.get("state") == "warming":
+                ent["state"] = "done"
+    except Exception as e:
+        with _guard:
+            ent = _index.get(batch_id)
+            if ent:
+                ent["state"] = "error"
+                ent["error"] = str(e)[:200]
+
+
+def _warm_batch(batch_id, lectures):
+    for vid, meta in list(lectures.items()):
+        with _guard:
+            ent = _index.get(batch_id)
+            if not ent or ent.get("state") != "warming":
+                return
+        while _breaker_open():      # respect an open breaker — no amplification
+            time.sleep(5)
+            with _guard:
+                ent = _index.get(batch_id)
+                if not ent or ent.get("state") != "warming":
+                    return
+        with _guard:                # already fresh (player beat us to it)?
+            c = _cache.get(vid)
+            fresh = bool(c) and time.time() < c.get("cache_until", 0) and \
+                c.get("data", {}).get("status") != "error"
+            in_job = vid in _jobs
+        if fresh or in_job:
+            with _guard:
+                ent = _index.get(batch_id)
+                if ent:
+                    ent["warmed"] = ent.get("warmed", 0) + 1
+            continue
+        params = {"batch_id": batch_id, "title": meta.get("title"),
+                  "subject_id": meta.get("subject_id"),
+                  "topic_id": meta.get("topic_id")}
+        lock = _lock_for(vid)
+        with lock:
+            try:
+                data = av.resolve(vid, batch_id, title=meta.get("title"),
+                                  subject_id=meta.get("subject_id"),
+                                  topic_id=meta.get("topic_id"), job_wait=0)
+            except av.JobInProgress as j:
+                _start_job(vid, j.ctx, params)
+                with _guard:
+                    ent = _index.get(batch_id)
+                    if ent:
+                        ent["warmed"] = ent.get("warmed", 0) + 1
+                continue
+            except av.UpstreamError as e:
+                if getattr(e, "status", None) == 500 and \
+                        "API Failed" in str(e):
+                    _mark_broken(batch_id, vid, e)
+                else:
+                    _breaker_record(False)
+                continue
+            except Exception:
+                continue
+            _breaker_record(True)
+            _store(vid, data, params)
+            with _guard:
+                ent = _index.get(batch_id)
+                if ent:
+                    ent["warmed"] = ent.get("warmed", 0) + 1
+            _index_stats["warmed"] += 1
+        time.sleep(0.3)
+
+
+def _recheck_broken():
+    """Probe up to 2 due broken videos per 30s tick (recover when fixed)."""
+    now = time.time()
+    due = []
+    with _guard:
+        for bid, ent in _index.items():
+            for vid, b in (ent.get("broken") or {}).items():
+                if b.get("recheck_at", 0) <= now:
+                    due.append((bid, vid))
+    for bid, vid in due[:2]:
+        try:
+            _recheck_one(bid, vid)
+        except Exception:
+            pass
+
+
+def _recheck_one(batch_id, video_id):
+    with _guard:
+        ent = _index.get(batch_id)
+        if not ent or video_id not in (ent.get("broken") or {}):
+            return
+        meta = (ent.get("lectures") or {}).get(video_id) or {}
+    params = {"batch_id": batch_id, "title": meta.get("title"),
+              "subject_id": meta.get("subject_id"),
+              "topic_id": meta.get("topic_id")}
+    lock = _lock_for(video_id)
+    with lock:
+        try:
+            data = av.resolve(video_id, batch_id, title=meta.get("title"),
+                              subject_id=meta.get("subject_id"),
+                              topic_id=meta.get("topic_id"), job_wait=0)
+        except av.JobInProgress as j:
+            _start_job(video_id, j.ctx, params)
+            with _guard:
+                ent = _index.get(batch_id)
+                if ent:
+                    (ent.get("broken") or {}).pop(video_id, None)
+                    ent["warmed"] = ent.get("warmed", 0) + 1
+            return
+        except Exception as e:
+            with _guard:
+                ent = _index.get(batch_id)
+                b = (ent or {}).get("broken", {}).get(video_id)
+                if b:
+                    b["error"] = str(e)[:160]
+                    b["at"] = int(time.time())
+                    b["recheck_at"] = time.time() + INDEX_RECHECK
+            return
+        _breaker_record(True)
+        _store(video_id, data, params)
+        with _guard:
+            ent = _index.get(batch_id)
+            if ent:
+                (ent.get("broken") or {}).pop(video_id, None)
+                ent["warmed"] = ent.get("warmed", 0) + 1
+        _index_stats["warmed"] += 1
+
+
+@app.post("/api/index")
+def index_start():
+    batch_id = (request.args.get("batch_id") or "").strip()
+    warm = (request.args.get("warm", "1").lower() not in ("0", "false", "no"))
+    force = (request.args.get("force", "").lower() in ("1", "true", "yes"))
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", batch_id):
+        return jsonify(ok=False, error="batch_id must be a 24-hex id"), 400
+    if force:
+        with _guard:
+            ent = _index.get(batch_id)
+            running = bool(ent) and ent.get("state") in ("harvesting",
+                                                          "warming")
+        if not running:
+            with _guard:
+                _index.pop(batch_id, None)
+    _ensure_index(batch_id, warm=warm)
+    st = _index_status(batch_id) or {"ok": True, "batch_id": batch_id}
+    return jsonify(**st), 202
+
+
+@app.get("/api/index")
+def index_status_ep():
+    batch_id = (request.args.get("batch_id") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", batch_id):
+        return jsonify(ok=False, error="batch_id must be a 24-hex id"), 400
+    st = _index_status(batch_id)
+    if not st:
+        return jsonify(ok=False, error="batch not indexed"), 404
+    return jsonify(**st)
+
+
 @app.get("/api/health")
 def health():
     with _guard:
         entries = len(_cache)
         jobs = len(_jobs)
+        indexed = len(_index)
         breaker_open = time.time() < _BREAKER["open_until"]
     return jsonify(ok=True, service="eduhubpi-video-api", upstream=av.BASE,
                    time=int(time.time()), cache_entries=entries,
                    refresh=dict(_refresh_stats), jobs=jobs,
+                   indexed=indexed, index_stats=dict(_index_stats),
                    breaker_open=breaker_open, stats=dict(av.stats))
 
 
@@ -214,6 +484,26 @@ def resolve():
         return jsonify(ok=False, error="video_id query param required"), 400
     if not re.fullmatch(r"[0-9a-fA-F]{24}", video_id):
         return jsonify(ok=False, error="video_id must be a 24-hex id"), 400
+
+    # auto-index: first request carrying a new batch_id kicks off the
+    # background catalog+warm index (never blocks this request)
+    if batch_id:
+        _ensure_index(batch_id)
+
+    # indexed-broken short-circuit: deterministic upstream 500s answer
+    # instantly instead of re-running the chain (force=1 bypasses to probe)
+    if batch_id and not force:
+        with _guard:
+            bent = ((_index.get(batch_id) or {}).get("broken") or {}) \
+                .get(video_id)
+        if bent and time.time() < bent.get("recheck_at", 0):
+            wait = max(1, int(bent["recheck_at"] - time.time()))
+            resp = jsonify(ok=False, retryable=True, upstream_broken=True,
+                           error="video unavailable upstream (AryaVidya "
+                                 "API 500) — queued for recheck",
+                           recheck_in=wait)
+            resp.headers["Retry-After"] = str(wait)
+            return resp, 502
 
     params = {"batch_id": batch_id, "title": title, "poster": poster,
               "subject_id": subject_id, "topic_id": topic_id}
@@ -258,7 +548,14 @@ def resolve():
                            job_id=jd.get("job_id"), progress=jd.get("progress"),
                            ph=jd.get("ph"), poll_ms=2000)
         except av.UpstreamError as e:
-            _breaker_record(False)
+            if getattr(e, "status", None) == 500 and "API Failed" in str(e):
+                # deterministic upstream breakage — record it (when the
+                # batch is indexed) for instant short-circuit, and don't
+                # trip the breaker: broken videos must not block good ones
+                if batch_id:
+                    _mark_broken(batch_id, video_id, e)
+            else:
+                _breaker_record(False)
             return jsonify(ok=False, error=str(e)), 502
         _breaker_record(True)
 
@@ -392,6 +689,10 @@ def _refresh_entry(video_id):
 def _refresher_loop():
     while True:
         time.sleep(30)
+        try:
+            _recheck_broken()
+        except Exception:
+            pass
         with _guard:
             due = [v for v, e in _cache.items()
                    if e.get("refresh_at", 0) <= time.time()]

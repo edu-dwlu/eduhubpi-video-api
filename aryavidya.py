@@ -537,6 +537,13 @@ def resolve(video_id, batch_id="", title=None, poster=None,
                                  started, attempt)
         except UpstreamError as e:
             last_err = e
+            # Deterministic upstream breakage: video-url-details answers
+            # HTTP 500 {"error":"API Failed"} for videos whose video doc is
+            # missing/unlinked upstream (AryaVidya's own SPA gets the same
+            # 500 — verified live). Retrying only burns the 55s budget
+            # (~48s for 6 attempts); one shot then abort.
+            if getattr(e, "status", None) == 500 and str(e) == "API Failed":
+                break
         except requests.RequestException as e:
             last_err = UpstreamError("network: %s" % e)
             is_net = True
@@ -549,6 +556,6 @@ def resolve(video_id, batch_id="", title=None, poster=None,
             break
         time.sleep(wait)
     raise UpstreamError(
-        "resolve failed after %d attempts (last: %s)" % (max_attempts, last_err),
+        "resolve failed after %d attempts (last: %s)" % (attempt, last_err),
         status=getattr(last_err, "status", None),
     )
