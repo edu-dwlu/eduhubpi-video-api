@@ -421,8 +421,11 @@ def _post_video_url(sess, token, v_stamp, env_sig):
         "Sec-Fetch-Site": "same-origin",
     }
     body = {"token": token, "v_stamp": v_stamp, "env_sig": env_sig}
+    # PW (penpencilvdo) videos take ~19-25s here (verified against the
+    # official player: its own POST measured 19.1s). 15s used to kill
+    # every PW resolve mid-flight → read-timeout storms → CF 502.
     r = sess.post(BASE + "/api/video-url-details.php", json=body,
-                  headers=headers, timeout=15)
+                  headers=headers, timeout=30)
     try:
         data = r.json()
     except Exception:
