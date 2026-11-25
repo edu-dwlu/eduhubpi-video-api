@@ -4,3 +4,5 @@ __pycache__/
 *.pid
 venv/
 .env
+state.json
+state.json.tmp

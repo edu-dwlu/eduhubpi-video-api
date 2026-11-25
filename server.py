@@ -8,6 +8,8 @@ Endpoints:
   GET  /api/index?batch_id=...                     (index status)
 """
 
+import json
+import os
 import re
 import threading
 import time
@@ -50,7 +52,9 @@ ALLOWED_STREAM_HOSTS = ("testwave.cc", "de5.net", "pw.live", "aryavidya.cc")
 # of holding a connection against Render's ~61s edge timeout.
 JOB_TIMEOUT = 900                 # upstream jobs observed completing in minutes
 JOB_TTL = 900                     # how long a processing entry stays valid
-ERROR_TTL = 60                    # short negative cache after a job/resolve failure
+ERROR_TTL = 300                   # negative cache after a job/resolve failure
+                                  # (5 min: stops player retries from re-arming
+                                  #  CDN_332 storms every minute)
 
 _cache = {}
 _locks = {}
@@ -80,6 +84,18 @@ _index = {}                        # batch_id -> index state dict
 _index_locks = {}
 INDEX_RECHECK = 20 * 60
 _index_stats = {"started": 0, "warmed": 0, "broken_marked": 0}
+
+# State persistence: _cache and _index live in process memory only, so a
+# gunicorn restart used to wipe every warmed URL and index catalog.  We
+# snapshot both to state.json every ~30s (and on index completion) and
+# reload the snapshot on boot — restarts are lossless.  In-flight work
+# (harvesting/warming entries, processing jobs) is intentionally NOT
+# saved: it dies with the process and re-kicks automatically.
+STATE_FILE = os.environ.get("EDUHUBPI_STATE_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "state.json")
+STATE_MAX_AGE = 24 * 3600          # ignore snapshots older than this
+_state_last_save = 0.0
+_state_meta = {"saved_at": 0, "restored_cache": 0, "restored_index": 0}
 
 
 def _store(video_id, data, params):
@@ -296,18 +312,21 @@ def _index_worker(batch_id, warm):
                        error="")
             ent["state"] = "warming" if warm else "done"
         if not warm:
+            _save_state()
             return
         _warm_batch(batch_id, lectures)
         with _guard:
             ent = _index.get(batch_id)
             if ent and ent.get("state") == "warming":
                 ent["state"] = "done"
+        _save_state()
     except Exception as e:
         with _guard:
             ent = _index.get(batch_id)
             if ent:
                 ent["state"] = "error"
                 ent["error"] = str(e)[:200]
+        _save_state()
 
 
 def _warm_batch(batch_id, lectures):
@@ -468,7 +487,12 @@ def health():
                    time=int(time.time()), cache_entries=entries,
                    refresh=dict(_refresh_stats), jobs=jobs,
                    indexed=indexed, index_stats=dict(_index_stats),
-                   breaker_open=breaker_open, stats=dict(av.stats))
+                   breaker_open=breaker_open, stats=dict(av.stats),
+                   state={"file": os.path.basename(STATE_FILE),
+                          "saved_at": _state_meta.get("saved_at", 0),
+                          "restored_cache": _state_meta.get("restored_cache", 0),
+                          "restored_index": _state_meta.get("restored_index", 0),
+                          "last_save_at": int(_state_last_save)})
 
 
 @app.get("/api/videos/resolve")
@@ -548,14 +572,27 @@ def resolve():
                            job_id=jd.get("job_id"), progress=jd.get("progress"),
                            ph=jd.get("ph"), poll_ms=2000)
         except av.UpstreamError as e:
+            marked = False
             if getattr(e, "status", None) == 500 and "API Failed" in str(e):
                 # deterministic upstream breakage — record it (when the
                 # batch is indexed) for instant short-circuit, and don't
                 # trip the breaker: broken videos must not block good ones
                 if batch_id:
-                    _mark_broken(batch_id, video_id, e)
+                    marked = _mark_broken(batch_id, video_id, e)
             else:
                 _breaker_record(False)
+            if not marked:
+                # negative-cache the failure for ERROR_TTL so player
+                # retries get an instant 502 instead of re-running a
+                # 37-55s CDN_332 storm (force=1 still bypasses to probe)
+                with _guard:
+                    _cache[video_id] = {
+                        "data": {"status": "error", "error": str(e)[:200],
+                                 "video_id": video_id},
+                        "cache_until": time.time() + ERROR_TTL,
+                        "refresh_at": time.time() + ERROR_TTL,
+                        "params": params,
+                    }
             return jsonify(ok=False, error=str(e)), 502
         _breaker_record(True)
 
@@ -647,6 +684,89 @@ def _rewrite_playlist(text, base_url):
     return "\n".join(out) + "\n"
 
 
+def _save_state():
+    """Atomically snapshot cache + index to STATE_FILE (restart safety).
+
+    Held under _guard for the whole write so json.dump never iterates a
+    dict that another thread is mutating; callers must NOT hold _guard.
+    """
+    global _state_last_save
+    now = time.time()
+    with _guard:
+        snap = {
+            "saved_at": now,
+            "cache": {k: v for k, v in _cache.items()
+                      if (v.get("data") or {}).get("status") != "processing"},
+            "index": {k: v for k, v in _index.items()
+                      if v.get("state") in ("done", "error")},
+            "index_stats": dict(_index_stats),
+        }
+        try:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(snap, f)
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, STATE_FILE)
+            _state_last_save = now
+            _state_meta["saved_at"] = int(now)
+        except Exception:
+            pass
+
+
+def _load_state():
+    """Best-effort restore of a previous snapshot after restart.
+
+    Expired cache URLs are dropped (re-resolve on demand); in-flight
+    index states were never saved, so the next resolve re-kicks them.
+    """
+    if not STATE_FILE:
+        return
+    try:
+        with open(STATE_FILE) as f:
+            snap = json.load(f)
+    except Exception:
+        return
+    if not isinstance(snap, dict) or \
+            time.time() - float(snap.get("saved_at") or 0) > STATE_MAX_AGE:
+        return
+    now = time.time()
+    n_cache = n_idx = 0
+    for vid, ent in (snap.get("cache") or {}).items():
+        if not isinstance(ent, dict) or not isinstance(ent.get("data"), dict):
+            continue
+        if float(ent.get("cache_until") or 0) <= now:
+            continue                      # expired — re-resolve on demand
+        with _guard:
+            _cache[vid] = ent
+        n_cache += 1
+    for bid, ent in (snap.get("index") or {}).items():
+        if not isinstance(ent, dict) or \
+                ent.get("state") not in ("done", "error"):
+            continue
+        lectures = ent.get("lectures") or {}
+        with _guard:
+            ent["warmed"] = sum(
+                1 for v in lectures
+                if v in _cache
+                and now < _cache[v].get("cache_until", 0)
+                and (_cache[v].get("data") or {}).get("status") != "error")
+            _index[bid] = ent
+        n_idx += 1
+    st = snap.get("index_stats")
+    if isinstance(st, dict):
+        with _guard:
+            for k in _index_stats:
+                if isinstance(st.get(k), (int, float)):
+                    _index_stats[k] = int(st[k])
+    _state_meta["restored_cache"] = n_cache
+    _state_meta["restored_index"] = n_idx
+    print("state restored: %d cache entries, %d batch indexes"
+          % (n_cache, n_idx), flush=True)
+
+
 def _refresh_entry(video_id):
     with _guard:
         ent = _cache.get(video_id)
@@ -690,6 +810,11 @@ def _refresher_loop():
     while True:
         time.sleep(30)
         try:
+            if time.time() - _state_last_save >= 30:
+                _save_state()
+        except Exception:
+            pass
+        try:
             _recheck_broken()
         except Exception:
             pass
@@ -703,6 +828,7 @@ def _refresher_loop():
                 pass
 
 
+_load_state()
 threading.Thread(target=_refresher_loop, daemon=True).start()
 
 
